@@ -485,15 +485,25 @@ function findMatchingProfile(profiles, { activeFingerprint, currentEmail }) {
   }
   if (activeFingerprint) {
     const byFp = profiles.find((p) => p.tokenFingerprint && p.tokenFingerprint === activeFingerprint);
-    if (byFp) return byFp;
+    if (byFp) {
+      if (normEmail && byFp.email && byFp.email !== normEmail) {
+        return null;
+      }
+      return byFp;
+    }
   }
   return null;
 }
 
 function upsertProfileWithSecret(registry, kc, rawSecret, meta = {}) {
   const fp = computeTokenFingerprint(rawSecret);
-  const email = normalizeEmail(meta.email) || extractEmailHintFromSecret(rawSecret);
-  const tierName = sanitizeTierName(meta.tierName || '') || extractTierHintFromSecret(rawSecret);
+  const secretEmail = extractEmailHintFromSecret(rawSecret);
+  const metaEmail = normalizeEmail(meta.email);
+  const emailMismatch = Boolean(secretEmail && metaEmail && secretEmail !== metaEmail);
+  const email = secretEmail || metaEmail;
+  const tierName = emailMismatch
+    ? extractTierHintFromSecret(rawSecret)
+    : (sanitizeTierName(meta.tierName || '') || extractTierHintFromSecret(rawSecret));
   const existing = findMatchingProfile(registry.profiles, {
     activeFingerprint: fp,
     currentEmail: email,
@@ -519,23 +529,29 @@ function upsertProfileWithSecret(registry, kc, rawSecret, meta = {}) {
   }
 
   const now = new Date().toISOString();
-  const rawMetaEmail = typeof meta.email === 'string' ? meta.email.trim() : '';
+  const rawMetaEmail = !emailMismatch && typeof meta.email === 'string' ? meta.email.trim() : '';
   const rawSecretEmail = extractRawEmailHintFromSecret(rawSecret);
+  const rawMetaOnboarding =
+    !emailMismatch && typeof meta.onboardingUsername === 'string' ? meta.onboardingUsername.trim() : '';
+  const metaOnboardingMatches =
+    Boolean(rawMetaOnboarding) && (!email || normalizeEmail(rawMetaOnboarding) === email);
+  const existingOnboardingMatches =
+    Boolean(existing?.onboardingUsername) && (!email || normalizeEmail(existing.onboardingUsername) === email);
   const onboardingUsername =
-    (typeof meta.onboardingUsername === 'string' && meta.onboardingUsername.trim()) ||
-    existing?.onboardingUsername ||
-    rawMetaEmail ||
+    (metaOnboardingMatches ? rawMetaOnboarding : '') ||
+    (existingOnboardingMatches ? existing.onboardingUsername : '') ||
     rawSecretEmail ||
+    rawMetaEmail ||
     email ||
     '';
   const onboardingIsGcpTos =
-    normalizeOnboardingIsGcpTos(meta.onboardingIsGcpTos) ||
+    (!emailMismatch ? normalizeOnboardingIsGcpTos(meta.onboardingIsGcpTos) : '') ||
     existing?.onboardingIsGcpTos ||
     extractIsGcpTosHintFromSecret(rawSecret);
   const nextEntry = normalizeRegistryEntry({
     id,
     email: email || existing?.email || '',
-    label: meta.label !== undefined ? meta.label : (existing?.label || ''),
+    label: !emailMismatch && meta.label !== undefined ? meta.label : (existing?.label || ''),
     tierName: tierName || existing?.tierName || '',
     savedAt: existing?.savedAt || now,
     lastUsedAt: now,
@@ -1043,6 +1059,23 @@ function executeColdAccountJob(job, options = {}) {
       if (!targetSecret) {
         return finalize({ ok: false, error: '钥匙串中未找到目标账号的备份凭据，请重新登录后保存' });
       }
+      const targetSecretEmail = extractEmailHintFromSecret(targetSecret);
+      const expectedTargetEmail =
+        normalizeEmail(targetProfile.email) || (targetId.includes('@') ? normalizeEmail(targetId) : '');
+      if (targetSecretEmail && expectedTargetEmail && targetSecretEmail !== expectedTargetEmail) {
+        appendColdLog(
+          stateDir,
+          `switch aborted: vault mismatch target=${targetId} expected=${expectedTargetEmail} actual=${targetSecretEmail}`
+        );
+        return finalize({
+          ok: false,
+          code: 'VAULT_IDENTITY_MISMATCH',
+          targetId,
+          expectedEmail: expectedTargetEmail,
+          actualEmail: targetSecretEmail,
+          error: `目标账号快照 (${expectedTargetEmail}) 对应的钥匙串凭据实际属于 ${targetSecretEmail}，已中止切换以防串号。请删除该异常快照后重新登录并保存`,
+        });
+      }
       const targetFp = computeTokenFingerprint(targetSecret);
 
       // Backup current active slot first so refreshed tokens are never lost
@@ -1052,7 +1085,10 @@ function executeColdAccountJob(job, options = {}) {
       if (activeSecret) {
         const activeFp = computeTokenFingerprint(activeSecret);
         if (activeFp !== targetFp) {
-          const hintEmail = normalizeEmail(job.currentEmail) || extractEmailHintFromSecret(activeSecret);
+          const activeSecretEmail = extractEmailHintFromSecret(activeSecret);
+          const jobEmail = normalizeEmail(job.currentEmail);
+          const jobMatchesActive = !activeSecretEmail || !jobEmail || jobEmail === activeSecretEmail;
+          const hintEmail = activeSecretEmail || jobEmail;
           const matchedPrev = findMatchingProfile(registry.profiles, {
             activeFingerprint: activeFp,
             currentEmail: hintEmail,
@@ -1068,15 +1104,22 @@ function executeColdAccountJob(job, options = {}) {
             : {};
           if (matchedPrev && matchedPrev.id !== targetId) {
             previousProfile = upsertProfileWithSecret(registry, kc, activeSecret, {
-              email: job.currentEmail || hintEmail || matchedPrev.email,
-              tierName: job.currentTierName || matchedPrev.tierName,
+              email:
+                (jobMatchesActive ? job.currentEmail : '') ||
+                extractRawEmailHintFromSecret(activeSecret) ||
+                hintEmail ||
+                matchedPrev.email,
+              tierName: (jobMatchesActive ? job.currentTierName : '') || matchedPrev.tierName,
               label: matchedPrev.label,
               ...outgoingMeta,
             });
           } else if (!matchedPrev) {
             previousProfile = upsertProfileWithSecret(registry, kc, activeSecret, {
-              email: job.currentEmail || hintEmail,
-              tierName: job.currentTierName || '',
+              email:
+                (jobMatchesActive ? job.currentEmail : '') ||
+                extractRawEmailHintFromSecret(activeSecret) ||
+                hintEmail,
+              tierName: jobMatchesActive ? (job.currentTierName || '') : '',
               ...outgoingMeta,
             });
             autoSavedPrevious = true;
@@ -1144,13 +1187,19 @@ function executeColdAccountJob(job, options = {}) {
       const activeSecret = kc.get(ACTIVE_KEYCHAIN_SERVICE, ACTIVE_KEYCHAIN_ACCOUNT);
       let backedUpProfile = null;
       if (activeSecret) {
-        const hintEmail = normalizeEmail(job.currentEmail) || extractEmailHintFromSecret(activeSecret);
+        const activeSecretEmail = extractEmailHintFromSecret(activeSecret);
+        const jobEmail = normalizeEmail(job.currentEmail);
+        const jobMatchesActive = !activeSecretEmail || !jobEmail || jobEmail === activeSecretEmail;
+        const hintEmail = activeSecretEmail || jobEmail;
         const outgoingMatchesStorage =
           Boolean(outgoingOnboarding.username) &&
           (!hintEmail || normalizeEmail(outgoingOnboarding.username) === hintEmail);
         backedUpProfile = upsertProfileWithSecret(registry, kc, activeSecret, {
-          email: job.currentEmail || hintEmail,
-          tierName: job.currentTierName || '',
+          email:
+            (jobMatchesActive ? job.currentEmail : '') ||
+            extractRawEmailHintFromSecret(activeSecret) ||
+            hintEmail,
+          tierName: jobMatchesActive ? (job.currentTierName || '') : '',
           ...(outgoingMatchesStorage
             ? {
                 onboardingUsername: outgoingOnboarding.username,

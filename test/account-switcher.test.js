@@ -865,3 +865,284 @@ test('cold switch captures exact onboarding casing/isGcpTos and restores target 
     });
   });
 });
+
+test('upsertProfileWithSecret prioritizes token id_token_email over stale meta.email and avoids corrupted fingerprint binding', () => {
+  const secretBob = encodeGoKeyringSecret({
+    id_token_email: 'Bob@Example.COM',
+    user_tier: 'g1-ultra-lite-tier',
+    tier_display_name: 'Google AI Ultra',
+    auth_method: 'consumer',
+    refresh_token: 'rt-bob-truth',
+  });
+  const secretAliceOld = encodeGoKeyringSecret({
+    id_token_email: 'alice@example.com',
+    refresh_token: 'rt-alice-valid',
+  });
+  const kc = makeMockKeychain({
+    'antigravity-hakimi-accounts::alice@example.com': secretAliceOld,
+  });
+  const registry = {
+    version: '1.0.0',
+    updatedAt: '',
+    profiles: [
+      {
+        id: 'alice@example.com',
+        email: 'alice@example.com',
+        label: 'AliceWork',
+        tierName: 'Google AI Ultra 20x',
+        // Simulate a legacy corrupted fingerprint colliding with Bob's token
+        tokenFingerprint: coldHelper.computeTokenFingerprint(secretBob),
+        onboardingUsername: 'alice@example.com',
+        onboardingIsGcpTos: 'false',
+      },
+    ],
+  };
+
+  const entry = coldHelper.upsertProfileWithSecret(registry, kc, secretBob, {
+    email: 'alice@example.com',
+    label: 'AliceWork',
+    tierName: 'Google AI Ultra 20x',
+    onboardingUsername: 'alice@example.com',
+    onboardingIsGcpTos: 'true',
+  });
+
+  // Must bind strictly to token's own id_token_email, never overwriting Alice's Vault slot or metadata
+  assert.equal(entry.id, 'bob@example.com');
+  assert.equal(entry.email, 'bob@example.com');
+  assert.equal(entry.label, '');
+  assert.equal(entry.tierName, 'Google AI Ultra 5x');
+  assert.equal(entry.onboardingUsername, 'Bob@Example.COM');
+  assert.equal(entry.onboardingIsGcpTos, 'false');
+  assert.equal(kc.get('antigravity-hakimi-accounts', 'bob@example.com'), secretBob);
+  assert.equal(kc.get('antigravity-hakimi-accounts', 'alice@example.com'), secretAliceOld);
+});
+
+test('saveCurrentAccount blocks saving when UI email conflicts with active Keychain id_token_email', () => {
+  withTempDir((tmp) => {
+    const secretBob = encodeGoKeyringSecret({
+      id_token_email: 'bob@gmail.com',
+      refresh_token: 'rt-bob-active',
+    });
+    const kc = makeMockKeychain({
+      'gemini::antigravity': secretBob,
+    });
+
+    const res = switcher.saveCurrentAccount(
+      { email: 'alice@gmail.com', tierName: 'Google AI Ultra 20x' },
+      { platform: 'darwin', stateDir: tmp, keychain: kc, detectAgyCliImpl: () => [] }
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'ACTIVE_IDENTITY_MISMATCH');
+    assert.equal(res.uiEmail, 'alice@gmail.com');
+    assert.equal(res.activeKeychainEmail, 'bob@gmail.com');
+    assert.match(res.error, /alice@gmail\.com/);
+    assert.match(res.error, /bob@gmail\.com/);
+    assert.equal(kc.calls.set.length, 0);
+    assert.equal(switcher.loadProfilesRegistry({ stateDir: tmp }).profiles.length, 0);
+  });
+});
+
+test('executeColdAccountJob switch aborts cleanly when target Vault snapshot id_token_email mismatches profile', () => {
+  withTempDir((tmp) => {
+    const homeDir = path.join(tmp, 'home');
+    const geminiDir = path.join(homeDir, '.gemini');
+    const userDataDir = path.join(homeDir, 'Library', 'Application Support', 'Antigravity');
+    const stateDir = path.join(tmp, 'state');
+    fs.mkdirSync(userDataDir, { recursive: true });
+    fs.mkdirSync(geminiDir, { recursive: true });
+
+    const appStoragePath = path.join(userDataDir, 'app_storage.json');
+    fs.writeFileSync(
+      appStoragePath,
+      JSON.stringify({ 'agy.onboarding.lastLoginUsername': 'charlie@gmail.com' })
+    );
+
+    const secretCharlie = encodeGoKeyringSecret({ id_token_email: 'charlie@gmail.com', refresh_token: 'rt-c' });
+    const secretBobPoisoned = encodeGoKeyringSecret({ id_token_email: 'bob@gmail.com', refresh_token: 'rt-b' });
+    const kc = makeMockKeychain({
+      'gemini::antigravity': secretCharlie,
+      // Poisoned Vault snapshot: stored under alice@gmail.com, but token actually belongs to bob@gmail.com
+      'antigravity-hakimi-accounts::alice@gmail.com': secretBobPoisoned,
+    });
+    switcher.saveProfilesRegistry(
+      {
+        profiles: [
+          {
+            id: 'alice@gmail.com',
+            email: 'alice@gmail.com',
+            tierName: 'Google AI Ultra 20x',
+            tokenFingerprint: coldHelper.computeTokenFingerprint(secretBobPoisoned),
+          },
+        ],
+      },
+      { stateDir }
+    );
+
+    const relaunches = [];
+    const res = coldHelper.executeColdAccountJob(
+      {
+        action: 'switch',
+        targetId: 'alice@gmail.com',
+        currentEmail: 'charlie@gmail.com',
+        appBundlePath: '/Applications/哈基米.app',
+        stateDir,
+        userDataDir,
+        geminiDir,
+        homeDir,
+      },
+      {
+        keychain: kc,
+        skipStop: true,
+        sleepImpl: () => {},
+        detectAgyCliImpl: () => [],
+        spawnImpl: (bin, args) => {
+          relaunches.push({ bin, args });
+          return { pid: 9001, unref() {} };
+        },
+      }
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'VAULT_IDENTITY_MISMATCH');
+    assert.equal(res.expectedEmail, 'alice@gmail.com');
+    assert.equal(res.actualEmail, 'bob@gmail.com');
+    assert.match(res.error, /alice@gmail\.com/);
+    assert.match(res.error, /bob@gmail\.com/);
+    // Active slot and app_storage must stay untouched, while app still relaunches so user sees error
+    assert.equal(kc.get('gemini', 'antigravity'), secretCharlie);
+    assert.deepEqual(JSON.parse(fs.readFileSync(appStoragePath, 'utf8')), {
+      'agy.onboarding.lastLoginUsername': 'charlie@gmail.com',
+    });
+    assert.equal(res.relaunched, true);
+    assert.equal(relaunches.length, 1);
+
+    const lastRes = JSON.parse(fs.readFileSync(coldHelper.getColdResultPath({ stateDir }), 'utf8'));
+    assert.equal(lastRes.ok, false);
+    assert.equal(lastRes.code, 'VAULT_IDENTITY_MISMATCH');
+  });
+});
+
+test('executeColdAccountJob switch and prepare-add use active token id_token_email when job.currentEmail is stale', () => {
+  withTempDir((tmp) => {
+    const homeDir = path.join(tmp, 'home');
+    const geminiDir = path.join(homeDir, '.gemini');
+    const userDataDir = path.join(homeDir, 'Library', 'Application Support', 'Antigravity');
+    const stateDir = path.join(tmp, 'state');
+    fs.mkdirSync(userDataDir, { recursive: true });
+    fs.mkdirSync(geminiDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userDataDir, 'app_storage.json'),
+      JSON.stringify({ 'agy.onboarding.lastLoginUsername': 'alice@gmail.com', 'agy.onboarding.lastLoginIsGcpTos': 'true' })
+    );
+
+    const secretAlice = encodeGoKeyringSecret({ id_token_email: 'alice@gmail.com', refresh_token: 'rt-alice' });
+    const secretBob = encodeGoKeyringSecret({ id_token_email: 'bob@gmail.com', user_tier: 'g1-ultra-lite-tier', refresh_token: 'rt-bob' });
+    const secretCharlie = encodeGoKeyringSecret({ id_token_email: 'charlie@gmail.com', refresh_token: 'rt-charlie' });
+
+    // 1. switch: active Keychain holds Bob, but stale job.currentEmail says Alice; switching to Charlie
+    const kc = makeMockKeychain({
+      'gemini::antigravity': secretBob,
+      'antigravity-hakimi-accounts::alice@gmail.com': secretAlice,
+      'antigravity-hakimi-accounts::charlie@gmail.com': secretCharlie,
+    });
+    switcher.saveProfilesRegistry(
+      {
+        profiles: [
+          { id: 'alice@gmail.com', email: 'alice@gmail.com', label: 'Alice', tierName: 'Google AI Ultra 20x', tokenFingerprint: coldHelper.computeTokenFingerprint(secretAlice) },
+          { id: 'charlie@gmail.com', email: 'charlie@gmail.com', label: 'Charlie', tierName: 'Pro', tokenFingerprint: coldHelper.computeTokenFingerprint(secretCharlie) },
+        ],
+      },
+      { stateDir }
+    );
+
+    const switchRes = coldHelper.executeColdAccountJob(
+      {
+        action: 'switch',
+        targetId: 'charlie@gmail.com',
+        currentEmail: 'alice@gmail.com',
+        currentTierName: 'Google AI Ultra 20x',
+        appBundlePath: '/Applications/哈基米.app',
+        stateDir,
+        userDataDir,
+        geminiDir,
+        homeDir,
+      },
+      { keychain: kc, skipStop: true, relaunch: false, detectAgyCliImpl: () => [] }
+    );
+    assert.equal(switchRes.ok, true);
+    assert.equal(switchRes.autoSavedPrevious, true);
+    assert.equal(switchRes.previousProfile.id, 'bob@gmail.com');
+    assert.equal(switchRes.previousProfile.tierName, 'Google AI Ultra 5x');
+    assert.equal(kc.get('antigravity-hakimi-accounts', 'alice@gmail.com'), secretAlice);
+    assert.equal(kc.get('antigravity-hakimi-accounts', 'bob@gmail.com'), secretBob);
+    assert.equal(kc.get('gemini', 'antigravity'), secretCharlie);
+
+    // 2. prepare-add: active Keychain holds Charlie, stale job.currentEmail says Alice
+    const prepRes = coldHelper.executeColdAccountJob(
+      {
+        action: 'prepare-add',
+        currentEmail: 'alice@gmail.com',
+        currentTierName: 'Google AI Ultra 20x',
+        appBundlePath: '/Applications/哈基米.app',
+        stateDir,
+        userDataDir,
+        geminiDir,
+        homeDir,
+      },
+      { keychain: kc, skipStop: true, relaunch: false, detectAgyCliImpl: () => [] }
+    );
+    assert.equal(prepRes.ok, true);
+    assert.equal(prepRes.backedUpProfile.id, 'charlie@gmail.com');
+    assert.equal(prepRes.backedUpProfile.tierName, 'Pro');
+    assert.equal(kc.get('antigravity-hakimi-accounts', 'alice@gmail.com'), secretAlice);
+    assert.equal(kc.get('antigravity-hakimi-accounts', 'charlie@gmail.com'), secretCharlie);
+    assert.equal(kc.get('gemini', 'antigravity'), null);
+  });
+});
+
+test('getAccountsStatus detects activeIdentityMismatch on fallback -w read without overwriting saved profile tier', () => {
+  withTempDir((tmp) => {
+    const secretBob = encodeGoKeyringSecret({
+      id_token_email: 'bob@gmail.com',
+      tier_display_name: 'Pro',
+      refresh_token: 'rt-bob-live',
+    });
+    const kc = makeMockKeychain({
+      'gemini::antigravity': secretBob,
+      'antigravity-hakimi-accounts::bob@gmail.com': secretBob,
+    });
+    switcher.saveProfilesRegistry(
+      {
+        profiles: [
+          {
+            id: 'bob@gmail.com',
+            email: 'bob@gmail.com',
+            tierName: 'Pro',
+            tokenFingerprint: coldHelper.computeTokenFingerprint(secretBob),
+          },
+        ],
+      },
+      { stateDir: tmp }
+    );
+
+    const status = switcher.getAccountsStatus({
+      platform: 'darwin',
+      stateDir: tmp,
+      keychain: kc,
+      currentEmail: 'alice@gmail.com',
+      currentTierName: 'Google AI Ultra 20x',
+      detectAgyCliImpl: () => [],
+    });
+
+    assert.equal(status.ok, true);
+    assert.equal(status.activeIdentityMismatch, true);
+    assert.equal(status.uiEmail, 'alice@gmail.com');
+    assert.equal(status.activeKeychainEmail, 'bob@gmail.com');
+    assert.equal(status.activeEmail, 'bob@gmail.com');
+    assert.equal(status.activeProfileId, 'bob@gmail.com');
+    assert.equal(status.activeTierName, 'Pro');
+    assert.equal(status.profiles[0].tierName, 'Pro');
+    assert.equal(switcher.loadProfilesRegistry({ stateDir: tmp }).profiles[0].tierName, 'Pro');
+  });
+});

@@ -189,6 +189,9 @@ function getAccountsStatus(options = {}) {
   let hintEmail = normalizeEmail(options.currentEmail);
   let hintTier = sanitizeTierName(options.currentTierName || '');
   let activeFingerprint = null;
+  let activeIdentityMismatch = false;
+  let activeKeychainEmail = null;
+  const uiEmail = hintEmail || null;
   let activeProfile = hasActiveToken && hintEmail
     ? findMatchingProfile(registry.profiles, { currentEmail: hintEmail })
     : null;
@@ -201,7 +204,17 @@ function getAccountsStatus(options = {}) {
         hasActiveToken = false;
       } else {
         activeFingerprint = computeTokenFingerprint(activeSecret);
-        if (!hintEmail) hintEmail = extractEmailHintFromSecret(activeSecret);
+        const secretEmail = extractEmailHintFromSecret(activeSecret);
+        if (secretEmail) {
+          activeKeychainEmail = secretEmail;
+          if (hintEmail && secretEmail !== hintEmail) {
+            activeIdentityMismatch = true;
+            hintEmail = secretEmail;
+            hintTier = extractTierHintFromSecret(activeSecret);
+          } else if (!hintEmail) {
+            hintEmail = secretEmail;
+          }
+        }
         if (!hintTier) hintTier = extractTierHintFromSecret(activeSecret);
         activeProfile = findMatchingProfile(registry.profiles, {
           activeFingerprint,
@@ -220,7 +233,7 @@ function getAccountsStatus(options = {}) {
 
   // Sync upgraded/more-specific live tier display name (e.g. Ultra 5x/20x) onto active saved profile
   const isMeaningfulTier = (v) => Boolean(v && v !== '未知' && v !== '未知套餐');
-  if (activeProfile && isMeaningfulTier(hintTier) && activeProfile.tierName !== hintTier) {
+  if (activeProfile && !activeIdentityMismatch && isMeaningfulTier(hintTier) && activeProfile.tierName !== hintTier) {
     const idx = registry.profiles.findIndex((p) => p.id === activeProfile.id);
     if (idx >= 0) {
       registry.profiles[idx] = { ...registry.profiles[idx], tierName: hintTier };
@@ -266,6 +279,8 @@ function getAccountsStatus(options = {}) {
     activeEmail: hintEmail || activeProfile?.email || null,
     activeTierName: sanitizeTierName(hintTier || activeProfile?.tierName || ''),
     activeProfileId: activeProfile ? activeProfile.id : null,
+    activeIdentityMismatch,
+    ...(activeIdentityMismatch ? { activeKeychainEmail, uiEmail } : {}),
     currentUnsaved: Boolean(hasActiveToken && !activeProfile),
     agyCliRunning: agyCliPids.length > 0,
     agyCliPids,
@@ -294,7 +309,19 @@ function saveCurrentAccount(payload = {}, options = {}) {
 
   try {
     const rawEmail = payload.email || payload.currentEmail || options.currentEmail || '';
-    const normEmail = normalizeEmail(rawEmail) || extractEmailHintFromSecret(activeSecret);
+    const metaEmail = normalizeEmail(rawEmail);
+    const secretEmail = extractEmailHintFromSecret(activeSecret);
+    if (metaEmail && secretEmail && metaEmail !== secretEmail) {
+      return {
+        ok: false,
+        supported: true,
+        code: 'ACTIVE_IDENTITY_MISMATCH',
+        uiEmail: metaEmail,
+        activeKeychainEmail: secretEmail,
+        error: `当前界面账号 (${metaEmail}) 与系统钥匙串活动凭据 (${secretEmail}) 不一致（可能被外部进程如 agy CLI 改写），已阻止保存以防串号。请重启应用同步登录态后重试`,
+      };
+    }
+    const normEmail = secretEmail || metaEmail;
     const userDataDir = options.userDataDir
       ? path.resolve(options.userDataDir)
       : getDefaultUserDataDir(process.platform, process.env, options.homeDir || os.homedir());
